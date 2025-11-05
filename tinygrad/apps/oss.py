@@ -97,15 +97,17 @@ class TransformerBlock:
   # ffn_up_exps
   # post_attention_norm
 
-  def __init__(self, experts: int, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int = 0):
+  def __init__(
+    self, experts: int, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int = 0
+  ):
     self.experts = experts
     self.n_heads = n_heads
     self.n_kv_heads = n_kv_heads
-    self.head_dim = dim // n_heads
+    self.head_dim = 64
     self.max_context = max_context
 
     a = 4096
-    b = 512 # n_heads * n_kv_heads ??
+    b = 512  # n_heads * n_kv_heads ??
 
     # --- attention projections (all linear, bias-free) ------------------
     self.attn_q = nn.Linear(dim, max_context, bias=True)
