@@ -1,6 +1,9 @@
 from __future__ import annotations
 import sys, argparse, typing, re, unicodedata
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, helpers
+import math
+
+# start with https://github.com/openai/gpt-oss/blob/48db88d8e29f48493fe75f084a8c9bd900a2b92f/gpt_oss/chat.py#L25
 
 
 class SimpleTokenizer:
@@ -27,8 +30,8 @@ class SimpleTokenizer:
   @staticmethod
   def from_gguf_kv(kv: dict):
     # https://github.com/ggml-org/llama.cpp/blob/94933c8c2eeaa9a7983e3f6c08af76bd86724094/src/llama-vocab.cpp#L1818-L1820
-    if kv["tokenizer.ggml.pre"] not in ("llama3", "llama-v3", "llama-bpe"):
-      raise ValueError(f"Invalid tokenizer preset '{kv['tokenizer.ggml.pre']}'")
+    # if kv["tokenizer.ggml.pre"] not in ("llama3", "llama-v3", "llama-bpe"):
+    # raise ValueError(f"Invalid tokenizer preset '{kv['tokenizer.ggml.pre']}'")
     vocab: typing.Iterable[tuple[str, int]] = ((tok, idx) for idx, tok in enumerate(kv["tokenizer.ggml.tokens"]))
     normal_tokens, special_tokens = helpers.partition(vocab, lambda e: kv["tokenizer.ggml.token_type"][e[1]] == 1)
     return SimpleTokenizer(dict(normal_tokens), dict(special_tokens))
@@ -79,27 +82,48 @@ def apply_rope(x: Tensor, start_pos: int | UOp, base: float = 10000.0) -> Tensor
 
 
 class TransformerBlock:
-  def __init__(self, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int = 0):
+  # attn_k
+  # attn_q
+  # attn_v
+  # attn_output
+  #
+  # attn_norm
+  # attn_sinks
+  #
+  # ffn_down_exps
+  # ffn_gate_exps
+  # ffn_gate_inp
+  #
+  # ffn_up_exps
+  # post_attention_norm
+
+  def __init__(self, experts: int, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int = 0):
+    self.experts = experts
     self.n_heads = n_heads
     self.n_kv_heads = n_kv_heads
     self.head_dim = dim // n_heads
     self.max_context = max_context
 
+    a = 4096
+    b = 512 # n_heads * n_kv_heads ??
+
     # --- attention projections (all linear, bias-free) ------------------
-    kv_proj_out = self.head_dim * n_kv_heads  # Llama-3 uses the same dim for K/V
-    self.attn_q = nn.Linear(dim, dim, bias=False)
-    self.attn_k = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_v = nn.Linear(dim, kv_proj_out, bias=False)
-    self.attn_output = nn.Linear(dim, dim, bias=False)
+    self.attn_q = nn.Linear(dim, max_context, bias=True)
+    self.attn_k = nn.Linear(dim, b, bias=True)
+    self.attn_v = nn.Linear(dim, b, bias=True)
+    self.attn_output = nn.Linear(a, dim, bias=True)
 
     # --- RMSNorms --------------------------------------------------------
     self.attn_norm = nn.RMSNorm(dim, norm_eps)
-    self.ffn_norm = nn.RMSNorm(dim, norm_eps)
+    self.attn_sinks = nn.RMSNorm(self.n_heads, norm_eps)
 
     # --- feed-forward ----------------------------------------------------
-    self.ffn_gate = nn.Linear(dim, hidden_dim, bias=False)
-    self.ffn_up = nn.Linear(dim, hidden_dim, bias=False)
-    self.ffn_down = nn.Linear(hidden_dim, dim, bias=False)
+    self.ffn_gate_inp = nn.Linear(hidden_dim, self.experts, bias=True)
+    self.ffn_gate_exps = MoELinear(self.experts, dim, dim, bias=True)
+    self.ffn_up_exps = MoELinear(self.experts, dim, hidden_dim, bias=True)
+    self.ffn_down_exps = MoELinear(self.experts, hidden_dim, dim, bias=True)
+
+    self.post_attention_norm = nn.RMSNorm(dim, norm_eps)
 
   def _attention(self, x: Tensor, start_pos: int | UOp) -> Tensor:
     x_norm = self.attn_norm(x)  # (B,T,D)
@@ -136,9 +160,57 @@ class TransformerBlock:
     return self._feed_forward(self._attention(x, start_pos)).contiguous()
 
 
+class MixtureFeedForward:
+  def __init__(self, num_experts: int, activated_experts: int, dim: int, hidden_dim: int, linear=nn.Linear):
+    self.activated_experts = activated_experts
+    self.gate = nn.Linear(dim, num_experts, bias=False)
+    self.up_proj = Tensor.zeros(num_experts, hidden_dim, dim, dtype="bfloat16")
+    self.down_proj = Tensor.zeros(num_experts, dim, hidden_dim, dtype="bfloat16")
+    self.gate_proj = Tensor.zeros(num_experts, hidden_dim, dim, dtype="bfloat16")
+
+  def __call__(self, x: Tensor) -> Tensor:
+    assert x.shape[0] == 1, "only BS=1"
+    assert x.shape[1] == 1, "only length=1"
+    g = self.gate(x).softmax(-1)
+
+    g = g.squeeze()  # (BS, length, num_experts) -> (num_experts,)
+    probs, sel = g.topk(self.activated_experts)
+
+    # run MoE
+    x_up_gate = x.dot(self.gate_proj[sel].permute(0, 2, 1)).silu() * x.dot(self.up_proj[sel].permute(0, 2, 1))
+    x_down = x_up_gate.dot(self.down_proj[sel].permute(0, 2, 1))
+    return (x_down * probs.reshape(self.activated_experts, 1, 1)).sum(axis=0)
+
+
+class MoELinear:
+  """
+  Applies a linear transformation to the incoming data.
+
+  See: https://pytorch.org/docs/stable/generated/torch.nn.Linear
+
+  ```python exec="true" source="above" session="tensor" result="python"
+  lin = nn.Linear(3, 4)
+  t = Tensor.rand(2, 3)
+  print(t.numpy())
+  ```
+  ```python exec="true" source="above" session="tensor" result="python"
+  t = lin(t)
+  print(t.numpy())
+  ```
+  """
+
+  def __init__(self, experts: int, in_features: int, out_features: int, bias=True):
+    bound = 1 / math.sqrt(in_features)
+    self.weight = Tensor.uniform(experts, out_features, in_features, low=-bound, high=bound)
+    self.bias = Tensor.uniform(experts, out_features, low=-bound, high=bound) if bias else None
+
+  def __call__(self, x: Tensor) -> Tensor:
+    return x.linear(self.weight.transpose(), self.bias)
+
+
 class Transformer:
-  def __init__(self, *, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, max_context):
-    self.blk = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context) for _ in range(num_blocks)]
+  def __init__(self, *, experts, num_blocks, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, vocab_size, max_context):
+    self.blk = [TransformerBlock(experts, dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context) for _ in range(num_blocks)]
     self.token_embd = nn.Embedding(vocab_size, dim)
     self.output_norm = nn.RMSNorm(dim, norm_eps)
     self.output = nn.Linear(dim, vocab_size, bias=False)
@@ -171,6 +243,7 @@ class Transformer:
     arch = kv["general.architecture"]
     max_context = min(max_context, kv[f"{arch}.context_length"]) if max_context is not None else kv[f"{arch}.context_length"]
     model = Transformer(
+      experts=kv[f"{arch}.expert_count"],
       num_blocks=kv[f"{arch}.block_count"],
       dim=kv[f"{arch}.embedding_length"],
       hidden_dim=kv[f"{arch}.feed_forward_length"],
