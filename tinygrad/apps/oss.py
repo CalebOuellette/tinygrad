@@ -97,9 +97,7 @@ class TransformerBlock:
   # ffn_up_exps
   # post_attention_norm
 
-  def __init__(
-    self, experts: int, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int = 0
-  ):
+  def __init__(self, experts: int, dim: int, hidden_dim: int, n_heads: int, n_kv_heads: int, norm_eps: float, max_context: int = 0):
     self.experts = experts
     self.n_heads = n_heads
     self.n_kv_heads = n_kv_heads
@@ -154,9 +152,9 @@ class TransformerBlock:
     return x + attn
 
   def _feed_forward(self, h: Tensor) -> Tensor:
-    h_norm = self.ffn_norm(h)
-    gated = self.ffn_gate(h_norm).silu() * self.ffn_up(h_norm)
-    return h + self.ffn_down(gated)
+    h_norm = self.post_attention_norm(h)
+    gated = self.ffn_gate_inp(h_norm).silu() * self.ffn_up_exps(h_norm)
+    return h + self.ffn_down_exps(gated)
 
   def __call__(self, x: Tensor, start_pos: int | UOp):
     return self._feed_forward(self._attention(x, start_pos)).contiguous()
@@ -235,9 +233,11 @@ class Transformer:
     # TODO: remove the need for copy to default device
     kv, state_dict = nn.state.gguf_load(gguf.to(None))
 
+
     # all state items should be float16, not float32
     state_dict = {k: v.cast("float16") if getenv("HALF", 1) else v for k, v in state_dict.items()}
-
+    for key in kv.keys():
+      print(key)
     # some models like Llama 3.2 don't have an output.weight, they just tie to the token_embd.weight
     if "output.weight" not in state_dict:
       state_dict["output.weight"] = state_dict["token_embd.weight"]
