@@ -97,7 +97,7 @@ class RotaryEmbedding:
     sin = freqs.sin() * concentration
     return cos, sin
 
-  def forward(
+  def __call__(
     self,
     query: Tensor,
     key: Tensor,
@@ -150,7 +150,7 @@ class AttentionBlock:
     self.num_key_value_heads = config.num_key_value_heads
     # Only apply sliding window to every other layer
     self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
-    self.sinks = torch.nn.Parameter(torch.empty(config.num_attention_heads))
+    self.sinks = Tensor.zeros(config.num_attention_heads)
     self.norm = nn.RMSNorm(config.hidden_size)
     qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
     self.qkv = nn.Linear(config.hidden_size, qkv_dim)
@@ -197,12 +197,12 @@ class AttentionBlock:
     return t
 
 
-def swiglu(x, alpha: float = 1.702, limit: float = 7.0):
+def swiglu(x: Tensor, alpha: float = 1.702, limit: float = 7.0):
   x_glu, x_linear = x[..., ::2], x[..., 1::2]
   # Clamp the input values
-  x_glu = x_glu.clamp(min=None, max=limit)
-  x_linear = x_linear.clamp(min=-limit, max=limit)
-  out_glu = x_glu * torch.sigmoid(alpha * x_glu)
+  x_glu = x_glu.clamp(None, limit)
+  x_linear = x_linear.clamp(-limit, limit)
+  out_glu = x_glu * (alpha * x_glu).sigmoid()
   # Note we add an extra bias of 1 to the linear layer
   return out_glu * (x_linear + 1)
 
@@ -220,49 +220,29 @@ class MLPBlock:
     self.norm = nn.RMSNorm(config.hidden_size)
     self.gate = nn.Linear(config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16)
     assert config.intermediate_size % self.world_size == 0
-    self.mlp1_weight = torch.nn.Parameter(
-      torch.empty(
-        (
-          config.num_experts,
-          config.intermediate_size * 2 // self.world_size,
-          config.hidden_size,
-        ),
-        device=device,
-        dtype=torch.bfloat16,
-      )
+
+    self.mlp1_weight = Tensor.zeros(
+      config.num_experts,
+      config.intermediate_size * 2 // self.world_size,
+      config.hidden_size,
     )
-    self.mlp1_bias = torch.nn.Parameter(
-      torch.empty(
-        (config.num_experts, config.intermediate_size * 2 // self.world_size),
-        device=device,
-        dtype=torch.bfloat16,
-      )
+    self.mlp1_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2 // self.world_size)
+
+    self.mlp2_weight = Tensor.zeros(
+      config.num_experts,
+      config.hidden_size,
+      config.intermediate_size // self.world_size,
     )
-    self.mlp2_weight = torch.nn.Parameter(
-      torch.empty(
-        (
-          config.num_experts,
-          config.hidden_size,
-          config.intermediate_size // self.world_size,
-        ),
-        device=device,
-        dtype=torch.bfloat16,
-      )
-    )
-    self.mlp2_bias = torch.nn.Parameter(
-      torch.empty(
-        (config.num_experts, config.hidden_size),
-        device=device,
-        dtype=torch.bfloat16,
-      )
+    self.mlp2_bias = Tensor.zeros(
+      config.num_experts,
+      config.hidden_size,
     )
 
   def forward(self, x: Tensor) -> Tensor:
     t = self.norm(x)
     g = self.gate(t)
-    experts = torch.topk(g, k=self.experts_per_token, dim=-1, sorted=True)
-    expert_weights = torch.nn.functional.softmax(experts.values, dim=1)
-    expert_indices = experts.indices
+    expert_values, expert_indices = g.topk(k=self.experts_per_token, dim=-1)
+    expert_weights = expert_values.softmax(1)
 
     # MLP #1
     mlp1_weight = self.mlp1_weight[expert_indices, ...]
@@ -308,7 +288,7 @@ class Transformer:
   ):
     super().__init__()
     self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-    self.block = torch.nn.ModuleList([TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
+    self.block = [TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
     self.norm = nn.RMSNorm(config.hidden_size)
     self.unembedding = nn.Linear(
       config.hidden_size,
