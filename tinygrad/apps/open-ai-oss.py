@@ -321,12 +321,24 @@ class MLPBlock:
     self.norm = nn.RMSNorm(config.hidden_size)
     self.gate = nn.Linear(config.hidden_size, config.num_experts)
 
-    self.mlp1_weight = Tensor.zeros(
-      config.num_experts,
-      config.intermediate_size * 2, # removed a 2x here idk
-      config.hidden_size,
-    )
-    self.mlp1_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2)
+    # self.mlp1_weight = Tensor.zeros(
+    #    config.num_experts,
+    #    config.intermediate_size * 2, # removed a 2x here idk
+    #    config.hidden_size,
+    # )
+    # self.mlp1_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2)
+    self.ffn_gate_exps_weight = Tensor.zeros(config.num_experts,
+      config.intermediate_size,
+      config.hidden_size)
+
+    self.ffn_gate_exps_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
+
+    self.ffn_up_exps_weight = Tensor.zeros(config.num_experts,
+      config.intermediate_size,
+      config.hidden_size)
+
+    self.ffn_up_exps_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
+
 
     self.mlp2_weight = Tensor.zeros(
       config.num_experts,
@@ -344,20 +356,23 @@ class MLPBlock:
     expert_values, expert_indices = g.topk(k=self.experts_per_token, dim=-1)
     expert_weights = expert_values.softmax(1)
 
+    mlp1_weight_combined = self.ffn_up_exps_weight.cat(self.ffn_gate_exps_weight, dim=1)
+    mlp1_bias_combined = self.ffn_up_exps_bias.cat(self.ffn_gate_exps_bias, dim=1)
+
     # MLP #1
-    mlp1_weight = self.mlp1_weight[expert_indices, ...]
-    mlp1_bias = self.mlp1_bias[expert_indices, ...]
-    t = Tensor.einsum("beck,bk->bec", mlp1_weight, t) + mlp1_bias
+    mlp1_weight = mlp1_weight_combined[expert_indices, ...].squeeze(0)
+    mlp1_bias = mlp1_bias_combined[expert_indices, ...].squeeze(0)
+    t = Tensor.einsum("beck,bk->bec", mlp1_weight, t.squeeze(0)) + mlp1_bias
     t = swiglu(t, limit=self.swiglu_limit)
 
     # MLP #2
-    mlp2_weight = self.mlp2_weight[expert_indices, ...]
-    mlp2_bias = self.mlp2_bias[expert_indices, ...]
-    t = Tensor.einsum("beck,bek->bec", mlp2_weight, t)
+    mlp2_weight = self.mlp2_weight[expert_indices, ...].squeeze(0)
+    mlp2_bias = self.mlp2_bias[expert_indices, ...].squeeze(0)
+    t = Tensor.einsum("beck,bek->bec", mlp2_weight, t.squeeze(0))
     t += mlp2_bias
 
     # Weighted sum of experts
-    t = Tensor.einsum("bec,be->bc", t, expert_weights)
+    t = Tensor.einsum("bec,be->bc", t, expert_weights.squeeze(0))
 
     return x + t
 
@@ -412,7 +427,8 @@ class Transformer:
     self.forward_jit.reset()  # TODO: why is this required? root cause the issue and make it not be needed
     while len(tokens) < self.max_context:
       t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
-      next_id = int(t.item())
+      out = t[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+      next_id = int(out.item())
       tokens.append(next_id)
       start_pos = len(tokens) - 1
       yield next_id
@@ -530,8 +546,18 @@ def rename_state_dict_keys(state_dict: dict, kv: dict) -> dict:
     state_dict[f'block.{i}.mlp.gate.bias'] = state_dict.pop(f'blk.{i}.ffn_gate_inp.bias')
 
     # blk.0.mlp.mlp1_weight
-    state_dict[f'block.{i}.mlp.mlp1_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
-    state_dict[f'block.{i}.mlp.mlp1_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
+    #state_dict[f'block.{i}.mlp.mlp1_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
+    #state_dict[f'block.{i}.mlp.mlp1_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
+
+    #ffn_up_exps
+    state_dict[f'block.{i}.mlp.ffn_up_exps_weight'] = state_dict.pop(f'blk.{i}.ffn_up_exps.weight')
+    state_dict[f'block.{i}.mlp.ffn_up_exps_bias'] = state_dict.pop(f'blk.{i}.ffn_up_exps.bias')
+
+    # ffn_gate_exps
+    state_dict[f'block.{i}.mlp.ffn_gate_exps_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
+    state_dict[f'block.{i}.mlp.ffn_gate_exps_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
+
+
     # blk.0.mlp.mlp2_weight
     state_dict[f'block.{i}.mlp.mlp2_weight'] = state_dict.pop(f'blk.{i}.ffn_down_exps.weight')
     state_dict[f'block.{i}.mlp.mlp2_bias'] = state_dict.pop(f'blk.{i}.ffn_down_exps.bias')
