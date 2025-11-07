@@ -4,7 +4,10 @@ from dataclasses import dataclass
 
 from typing import Tuple
 import sys, argparse
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, helpers
+import typing, re, unicodedata
+
+
 
 
 class SimpleTokenizer:
@@ -245,8 +248,11 @@ class AttentionBlock:
     self.sliding_window = config.sliding_window if layer_idx % 2 == 0 else 0
     self.sinks = Tensor.zeros(config.num_attention_heads)
     self.norm = nn.RMSNorm(config.hidden_size)
-    qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
-    self.qkv = nn.Linear(config.hidden_size, qkv_dim)
+    # qkv_dim = config.head_dim * (config.num_attention_heads + 2 * config.num_key_value_heads)
+    # self.qkv = nn.Linear(config.hidden_size, qkv_dim)
+    self.attn_q = nn.Linear(config.hidden_size, config.head_dim * config.num_attention_heads, bias=True)
+    self.attn_k = nn.Linear(config.hidden_size, config.head_dim * config.num_key_value_heads, bias=True)
+    self.attn_v = nn.Linear(config.hidden_size, config.head_dim * config.num_key_value_heads, bias=True)
     self.out = nn.Linear(
       config.head_dim * config.num_attention_heads,
       config.hidden_size,
@@ -263,18 +269,21 @@ class AttentionBlock:
 
   def __call__(self, x: Tensor) -> Tensor:
     t = self.norm(x)
-    qkv = self.qkv(t)
-    q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
-    k = qkv[
-      :,
-      self.num_attention_heads * self.head_dim : (self.num_attention_heads + self.num_key_value_heads) * self.head_dim,
-    ].contiguous()
-    v = qkv[
-      :,
-      (self.num_attention_heads + self.num_key_value_heads) * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
-      * self.head_dim,
-    ].contiguous()
+    # qkv = self.qkv(t)
+    # q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
+    # k = qkv[
+    #   :,
+    #   self.num_attention_heads * self.head_dim : (self.num_attention_heads + self.num_key_value_heads) * self.head_dim,
+    # ].contiguous()
+    # v = qkv[
+    #   :,
+    #   (self.num_attention_heads + self.num_key_value_heads) * self.head_dim : (self.num_attention_heads + 2 * self.num_key_value_heads)
+    #   * self.head_dim,
+    # ].contiguous()
 
+    q = self.attn_q(t)
+    k = self.attn_k(t)
+    v = self.attn_v(t)
     q = q.view(
       -1,
       self.num_key_value_heads,
@@ -314,7 +323,7 @@ class MLPBlock:
 
     self.mlp1_weight = Tensor.zeros(
       config.num_experts,
-      config.intermediate_size * 2,
+      config.intermediate_size * 2, # removed a 2x here idk
       config.hidden_size,
     )
     self.mlp1_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2)
@@ -376,8 +385,8 @@ class Transformer:
     config: ModelConfig,
   ):
     super().__init__()
-    self.token_embd = nn.Embedding(config.vocab_size, config.hidden_size)
-    self.blk = [TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
+    self.block = [TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
     self.norm = nn.RMSNorm(config.hidden_size)
     self.unembedding = nn.Linear(
       config.hidden_size,
@@ -411,51 +420,48 @@ class Transformer:
   def __call__(self, tokens: Tensor, start_pos: int | UOp = 0) -> Tensor:
     return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens)
 
-  # @staticmethod
-  # def from_checkpoint(path: str, device: str | torch.device = "cuda") -> "Transformer":
-  #   if not isinstance(device, torch.device):
-  #     device = torch.device(device)
+  @staticmethod
+  def from_checkpoint(path: str) -> "Transformer":
+    config_path = os.path.join(path, "config.json")
+    with open(config_path, "r") as f:
+      json_config = json.load(f)
+      config = ModelConfig(**json_config)
 
-  #   config_path = os.path.join(path, "config.json")
-  #   with open(config_path, "r") as f:
-  #     json_config = json.load(f)
-  #     config = ModelConfig(**json_config)
+    model = Transformer(
+      config=config,
+    )
+    model.eval()
 
-  #   model = Transformer(
-  #     config=config,
-  #   )
-  #   model.eval()
+    # Load weights
+    my_rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    per_rank_intermediate_size = config.intermediate_size // world_size
 
-  #   # Load weights
-  #   my_rank = dist.get_rank() if dist.is_initialized() else 0
-  #   world_size = dist.get_world_size() if dist.is_initialized() else 1
-  #   per_rank_intermediate_size = config.intermediate_size // world_size
+    checkpoint = Checkpoint(path, device)
 
-  #   checkpoint = Checkpoint(path, device)
+    for name, param in model.named_parameters():
+      loaded_tensor = checkpoint.get(name)
 
-  #   for name, param in model.named_parameters():
-  #     loaded_tensor = checkpoint.get(name)
+      # Note: it would be more efficient to do sharding before upcasting from MXFP4,
+      # but for simplicity we do it after.
+      if "mlp1" in name:  # both weight and bias
+        loaded_tensor = loaded_tensor[
+          :,
+          my_rank * 2 * per_rank_intermediate_size : (my_rank + 1) * 2 * per_rank_intermediate_size,
+          ...,
+        ]
+      elif "mlp2_weight" in name:  # only weight
+        loaded_tensor = loaded_tensor[
+          ...,
+          my_rank * per_rank_intermediate_size : (my_rank + 1) * per_rank_intermediate_size,
+        ]
+      try:
+        param.data.copy_(loaded_tensor)
+      except:
+        print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
+        raise
 
-  #     # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-  #     # but for simplicity we do it after.
-  #     if "mlp1" in name:  # both weight and bias
-  #       loaded_tensor = loaded_tensor[
-  #         :,
-  #         my_rank * 2 * per_rank_intermediate_size : (my_rank + 1) * 2 * per_rank_intermediate_size,
-  #         ...,
-  #       ]
-  #     elif "mlp2_weight" in name:  # only weight
-  #       loaded_tensor = loaded_tensor[
-  #         ...,
-  #         my_rank * per_rank_intermediate_size : (my_rank + 1) * per_rank_intermediate_size,
-  #       ]
-  #     try:
-  #       param.data.copy_(loaded_tensor)
-  #     except:
-  #       print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-  #       raise
-
-  #   return model
+    return model
 
 
 # class TokenGenerator:
@@ -494,11 +500,41 @@ models = {
 
 
 def rename_state_dict_keys(state_dict: dict, kv: dict) -> dict:
+  # norm.weight
+  state_dict['norm.weight'] = state_dict.pop('output_norm.weight')
+  state_dict['unembedding.weight'] = state_dict.pop('output.weight')
+  state_dict['embedding.weight'] = state_dict.pop('token_embd.weight')
+
   for i in range(0, kv['gpt-oss.block_count']):
     # attention
-    state_dict[f'blk.{i}.attn.sinks'] = state_dict.pop(f'blk.{i}.attn_sinks.weight')
-    state_dict[f'blk.{i}.attn.norm.weight'] = state_dict.pop(f'blk.{i}.attn_norm.weight')
-    state_dict[f'blk.{i}.attn.qkv.weight'] = state_dict.pop(f'blk.{i}.attn_qkv.weight')
+    state_dict[f'block.{i}.attn.sinks'] = state_dict.pop(f'blk.{i}.attn_sinks.weight')
+    state_dict[f'block.{i}.attn.norm.weight'] = state_dict.pop(f'blk.{i}.attn_norm.weight')
+
+
+    # blk.0.attn.attn_q.weight
+    state_dict[f'block.{i}.attn.attn_q.weight'] = state_dict.pop(f'blk.{i}.attn_q.weight')
+    state_dict[f'block.{i}.attn.attn_q.bias'] = state_dict.pop(f'blk.{i}.attn_q.bias')
+    state_dict[f'block.{i}.attn.attn_k.weight'] = state_dict.pop(f'blk.{i}.attn_k.weight')
+    state_dict[f'block.{i}.attn.attn_k.bias'] = state_dict.pop(f'blk.{i}.attn_k.bias')
+    state_dict[f'block.{i}.attn.attn_v.weight'] = state_dict.pop(f'blk.{i}.attn_v.weight')
+    state_dict[f'block.{i}.attn.attn_v.bias'] = state_dict.pop(f'blk.{i}.attn_v.bias')
+    # blk.0.attn_output.weight
+    state_dict[f'block.{i}.attn.out.weight'] = state_dict.pop(f'blk.{i}.attn_output.weight')
+    state_dict[f'block.{i}.attn.out.bias'] = state_dict.pop(f'blk.{i}.attn_output.bias')
+
+    # mlp
+    # blk.0.mlp.norm.weight
+    state_dict[f'block.{i}.mlp.norm.weight'] = state_dict.pop(f'blk.{i}.post_attention_norm.weight')
+    # blk.0.mlp.gate.weight
+    state_dict[f'block.{i}.mlp.gate.weight'] = state_dict.pop(f'blk.{i}.ffn_gate_inp.weight')
+    state_dict[f'block.{i}.mlp.gate.bias'] = state_dict.pop(f'blk.{i}.ffn_gate_inp.bias')
+
+    # blk.0.mlp.mlp1_weight
+    state_dict[f'block.{i}.mlp.mlp1_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
+    state_dict[f'block.{i}.mlp.mlp1_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
+    # blk.0.mlp.mlp2_weight
+    state_dict[f'block.{i}.mlp.mlp2_weight'] = state_dict.pop(f'blk.{i}.ffn_down_exps.weight')
+    state_dict[f'block.{i}.mlp.mlp2_bias'] = state_dict.pop(f'blk.{i}.ffn_down_exps.bias')
 
   return state_dict
 
