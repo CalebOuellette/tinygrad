@@ -1,12 +1,11 @@
 from __future__ import annotations
-import json
 import math
-import os
 from dataclasses import dataclass
 
 from typing import Tuple
-import sys, argparse, typing, re, unicodedata
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, helpers
+import sys, argparse
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv
+from .llm import SimpleTokenizer
 
 
 @dataclass
@@ -29,8 +28,37 @@ class ModelConfig:
   rope_ntk_beta: float = 32.0
 
 
-def build_config_from_remote():
-  return ModelConfig()
+def build_config_from_kv(kv: dict) -> ModelConfig:
+  """Convert GGUF KV pairs to ModelConfig.
+
+  Mapping from GGUF keys to ModelConfig fields:
+  - gpt-oss.block_count -> num_hidden_layers
+  - gpt-oss.expert_count -> num_experts
+  - gpt-oss.expert_used_count -> experts_per_token
+  - gpt-oss.embedding_length -> hidden_size
+  - gpt-oss.feed_forward_length -> intermediate_size
+  - gpt-oss.attention.head_count -> num_attention_heads
+  - gpt-oss.attention.head_count_kv -> num_key_value_heads
+  - gpt-oss.attention.key_length -> head_dim
+  - gpt-oss.attention.sliding_window -> sliding_window
+  - gpt-oss.rope.freq_base -> rope_theta
+  - gpt-oss.rope.scaling.factor -> rope_scaling_factor
+  - gpt-oss.context_length -> initial_context_length
+  """
+  return ModelConfig(
+    num_hidden_layers=kv.get("gpt-oss.block_count", 36),
+    num_experts=kv.get("gpt-oss.expert_count", 28),
+    experts_per_token=kv.get("gpt-oss.expert_used_count", 4),
+    hidden_size=kv.get("gpt-oss.embedding_length", 2880),
+    intermediate_size=kv.get("gpt-oss.feed_forward_length", 2880),
+    num_attention_heads=kv.get("gpt-oss.attention.head_count", 64),
+    num_key_value_heads=kv.get("gpt-oss.attention.head_count_kv", 8),
+    head_dim=kv.get("gpt-oss.attention.key_length", 64),
+    sliding_window=kv.get("gpt-oss.attention.sliding_window", 128),
+    rope_theta=kv.get("gpt-oss.rope.freq_base", 150000.0),
+    rope_scaling_factor=kv.get("gpt-oss.rope.scaling.factor", 32.0),
+    initial_context_length=kv.get("gpt-oss.context_length", 4096),
+  )
 
 
 def _apply_rotary_emb(
@@ -117,7 +145,7 @@ class RotaryEmbedding:
     return query, key
 
 
-def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
+def sdpa(Q: Tensor, K: Tensor, V: Tensor, S: Tensor, sm_scale, sliding_window=0):
   # sliding_window == 0 means no sliding window
   n_tokens, n_heads, q_mult, d_head = Q.shape
   assert K.shape == (n_tokens, n_heads, d_head)
@@ -125,9 +153,12 @@ def sdpa(Q, K, V, S, sm_scale, sliding_window=0):
   K = K[:, :, None, :].expand(-1, -1, q_mult, -1)
   V = V[:, :, None, :].expand(-1, -1, q_mult, -1)
   S = S.reshape(n_heads, q_mult, 1, 1).expand(-1, -1, n_tokens, -1)
-  mask = torch.triu(Q.new_full((n_tokens, n_tokens), -float("inf")), diagonal=1)
+
+  new_full = Tensor.full((n_tokens, n_tokens), -float("inf"))
+  mask = new_full.triu(diagonal=1)
   if sliding_window > 0:
-    mask += torch.tril(mask.new_full((n_tokens, n_tokens), -float("inf")), diagonal=-sliding_window)
+    new_full_two = Tensor.full((n_tokens, n_tokens), -float("inf"))
+    mask += new_full_two.tril(diagonal=-sliding_window)
   QK = Tensor.einsum("qhmd,khmd->hmqk", Q, K)
   QK = QK * sm_scale
   QK += mask[None, None, :, :]
@@ -168,7 +199,7 @@ class AttentionBlock:
       ntk_beta=config.rope_ntk_beta,
     )
 
-  def forward(self, x: Tensor) -> Tensor:
+  def __call__(self, x: Tensor) -> Tensor:
     t = self.norm(x)
     qkv = self.qkv(t)
     q = qkv[:, : self.num_attention_heads * self.head_dim].contiguous()
@@ -216,14 +247,12 @@ class MLPBlock:
     self.num_experts = config.num_experts
     self.experts_per_token = config.experts_per_token
     self.swiglu_limit = config.swiglu_limit
-    self.world_size = dist.get_world_size() if dist.is_initialized() else 1
     self.norm = nn.RMSNorm(config.hidden_size)
     self.gate = nn.Linear(config.hidden_size, config.num_experts, device=device, dtype=torch.bfloat16)
-    assert config.intermediate_size % self.world_size == 0
 
     self.mlp1_weight = Tensor.zeros(
       config.num_experts,
-      config.intermediate_size * 2 // self.world_size,
+      config.intermediate_size * 2,
       config.hidden_size,
     )
     self.mlp1_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2 // self.world_size)
@@ -231,14 +260,14 @@ class MLPBlock:
     self.mlp2_weight = Tensor.zeros(
       config.num_experts,
       config.hidden_size,
-      config.intermediate_size // self.world_size,
+      config.intermediate_size,
     )
     self.mlp2_bias = Tensor.zeros(
       config.num_experts,
       config.hidden_size,
     )
 
-  def forward(self, x: Tensor) -> Tensor:
+  def __call__(self, x: Tensor) -> Tensor:
     t = self.norm(x)
     g = self.gate(t)
     expert_values, expert_indices = g.topk(k=self.experts_per_token, dim=-1)
@@ -254,8 +283,6 @@ class MLPBlock:
     mlp2_weight = self.mlp2_weight[expert_indices, ...]
     mlp2_bias = self.mlp2_bias[expert_indices, ...]
     t = Tensor.einsum("beck,bek->bec", mlp2_weight, t)
-    if self.world_size > 1:
-      dist.all_reduce(t, op=dist.ReduceOp.SUM)
     t += mlp2_bias
 
     # Weighted sum of experts
@@ -275,7 +302,7 @@ class TransformerBlock:
     self.attn = AttentionBlock(config, layer_idx)
     self.mlp = MLPBlock(config)
 
-  def forward(self, x: Tensor) -> Tensor:
+  def __call__(self, x: Tensor) -> Tensor:
     x = self.attn(x)
     x = self.mlp(x)
     return x
@@ -296,6 +323,9 @@ class Transformer:
       bias=False,
     )
 
+    self.forward_jit = TinyJit(self.forward)
+    self.max_context = 2048
+
   def forward(self, x: Tensor) -> Tensor:
     x = self.embedding(x)
     for block in self.block:
@@ -304,80 +334,95 @@ class Transformer:
     x = self.unembedding(x)
     return x
 
-  @staticmethod
-  def from_checkpoint(path: str, device: str | torch.device = "cuda") -> "Transformer":
-    if not isinstance(device, torch.device):
-      device = torch.device(device)
+  def generate(self, tokens: list[int], start_pos=0):
+    v_start_pos = UOp.variable("start_pos", 1, self.max_context - 1)
+    start_pos = 0
+    t = Tensor([tokens[start_pos:]], dtype="int32")
+    self.forward_jit.reset()  # TODO: why is this required? root cause the issue and make it not be needed
+    while len(tokens) < self.max_context:
+      t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
+      next_id = int(t.item())
+      tokens.append(next_id)
+      start_pos = len(tokens) - 1
+      yield next_id
 
-    config_path = os.path.join(path, "config.json")
-    with open(config_path, "r") as f:
-      json_config = json.load(f)
-      config = ModelConfig(**json_config)
+  def __call__(self, tokens: Tensor, start_pos: int | UOp = 0) -> Tensor:
+    return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens)
 
-    model = Transformer(
-      config=config,
-    )
-    model.eval()
+  # @staticmethod
+  # def from_checkpoint(path: str, device: str | torch.device = "cuda") -> "Transformer":
+  #   if not isinstance(device, torch.device):
+  #     device = torch.device(device)
 
-    # Load weights
-    my_rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    per_rank_intermediate_size = config.intermediate_size // world_size
+  #   config_path = os.path.join(path, "config.json")
+  #   with open(config_path, "r") as f:
+  #     json_config = json.load(f)
+  #     config = ModelConfig(**json_config)
 
-    checkpoint = Checkpoint(path, device)
+  #   model = Transformer(
+  #     config=config,
+  #   )
+  #   model.eval()
 
-    for name, param in model.named_parameters():
-      loaded_tensor = checkpoint.get(name)
+  #   # Load weights
+  #   my_rank = dist.get_rank() if dist.is_initialized() else 0
+  #   world_size = dist.get_world_size() if dist.is_initialized() else 1
+  #   per_rank_intermediate_size = config.intermediate_size // world_size
 
-      # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-      # but for simplicity we do it after.
-      if "mlp1" in name:  # both weight and bias
-        loaded_tensor = loaded_tensor[
-          :,
-          my_rank * 2 * per_rank_intermediate_size : (my_rank + 1) * 2 * per_rank_intermediate_size,
-          ...,
-        ]
-      elif "mlp2_weight" in name:  # only weight
-        loaded_tensor = loaded_tensor[
-          ...,
-          my_rank * per_rank_intermediate_size : (my_rank + 1) * per_rank_intermediate_size,
-        ]
-      try:
-        param.data.copy_(loaded_tensor)
-      except:
-        print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-        raise
+  #   checkpoint = Checkpoint(path, device)
 
-    return model
+  #   for name, param in model.named_parameters():
+  #     loaded_tensor = checkpoint.get(name)
+
+  #     # Note: it would be more efficient to do sharding before upcasting from MXFP4,
+  #     # but for simplicity we do it after.
+  #     if "mlp1" in name:  # both weight and bias
+  #       loaded_tensor = loaded_tensor[
+  #         :,
+  #         my_rank * 2 * per_rank_intermediate_size : (my_rank + 1) * 2 * per_rank_intermediate_size,
+  #         ...,
+  #       ]
+  #     elif "mlp2_weight" in name:  # only weight
+  #       loaded_tensor = loaded_tensor[
+  #         ...,
+  #         my_rank * per_rank_intermediate_size : (my_rank + 1) * per_rank_intermediate_size,
+  #       ]
+  #     try:
+  #       param.data.copy_(loaded_tensor)
+  #     except:
+  #       print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
+  #       raise
+
+  #   return model
 
 
-class TokenGenerator:
-  def __init__(self, checkpoint: str, device: torch.device):
-    self.device = device
-    self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
+# class TokenGenerator:
+#   def __init__(self, checkpoint: str, device: torch.device):
+#     self.device = device
+#     self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
 
-  def generate(self, prompt_tokens: list[int], stop_tokens: list[int], temperature: float = 1.0, max_tokens: int = 0, return_logprobs: bool = False):
-    tokens = list(prompt_tokens)
-    num_generated_tokens = 0
-    while max_tokens == 0 or num_generated_tokens < max_tokens:
-      logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
-      if temperature == 0.0:
-        predicted_token = torch.argmax(logits, dim=-1).item()
-      else:
-        probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-        predicted_token = torch.multinomial(probs, num_samples=1).item()
-      tokens.append(predicted_token)
-      num_generated_tokens += 1
+#   def generate(self, prompt_tokens: list[int], stop_tokens: list[int], temperature: float = 1.0, max_tokens: int = 0, return_logprobs: bool = False):
+#     tokens = list(prompt_tokens)
+#     num_generated_tokens = 0
+#     while max_tokens == 0 or num_generated_tokens < max_tokens:
+#       logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
+#       if temperature == 0.0:
+#         predicted_token = torch.argmax(logits, dim=-1).item()
+#       else:
+#         probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
+#         predicted_token = torch.multinomial(probs, num_samples=1).item()
+#       tokens.append(predicted_token)
+#       num_generated_tokens += 1
 
-      if return_logprobs:
-        logprobs = torch.log_softmax(logits, dim=-1)
-        selected_logprobs = logprobs[predicted_token].item()
-        yield predicted_token, selected_logprobs
-      else:
-        yield predicted_token
+#       if return_logprobs:
+#         logprobs = torch.log_softmax(logits, dim=-1)
+#         selected_logprobs = logprobs[predicted_token].item()
+#         yield predicted_token, selected_logprobs
+#       else:
+#         yield predicted_token
 
-      if predicted_token in stop_tokens:
-        break
+#       if predicted_token in stop_tokens:
+#         break
 
 
 models = {
@@ -395,7 +440,7 @@ if __name__ == "__main__":
   #
   kv, state_dict = nn.state.gguf_load(Tensor.from_url(models[args.size]).to(None))
 
-  model_config = build_config_from_remote()
+  model_config = build_config_from_kv(kv)
 
   model = Transformer(model_config)
 
