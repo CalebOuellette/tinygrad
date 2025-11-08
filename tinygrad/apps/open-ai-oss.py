@@ -401,7 +401,7 @@ class Transformer:
   ):
     super().__init__()
     self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-    self.block = [TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+    self.block = [TransformerBlock(config, layer_idx) for layer_idx in range(2)]
     self.norm = nn.RMSNorm(config.hidden_size)
     self.unembedding = nn.Linear(
       config.hidden_size,
@@ -421,13 +421,11 @@ class Transformer:
     return x
 
   def generate(self, tokens: list[int], start_pos=0):
-    v_start_pos = UOp.variable("start_pos", 1, self.max_context - 1)
     start_pos = 0
-    t = Tensor([tokens[start_pos:]], dtype="int32")
-    self.forward_jit.reset()  # TODO: why is this required? root cause the issue and make it not be needed
     while len(tokens) < self.max_context:
-      t = self(t, v_start_pos.bind(start_pos) if getenv("SYM", 1) and start_pos != 0 and t.shape[-1] == 1 else start_pos)
-      out = t[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+      t = Tensor([tokens], dtype="int32")
+      output = self(t, start_pos)
+      out = output[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
       next_id = int(out.item())
       tokens.append(next_id)
       start_pos = len(tokens) - 1
