@@ -6,8 +6,7 @@ from typing import Tuple
 import sys, argparse
 from tinygrad import Tensor, nn, UOp, TinyJit, getenv, helpers
 import typing, re, unicodedata
-
-
+from tinygrad.helpers import GlobalCounters
 
 
 class SimpleTokenizer:
@@ -321,24 +320,20 @@ class MLPBlock:
     self.norm = nn.RMSNorm(config.hidden_size)
     self.gate = nn.Linear(config.hidden_size, config.num_experts)
 
-    # self.mlp1_weight = Tensor.zeros(
+    # the model weights loaded from GGUF are already split into ffn_up and ffn_gate experts
+    # self.mlp1_weight = Tensor.zeros( 
     #    config.num_experts,
-    #    config.intermediate_size * 2, # removed a 2x here idk
+    #    config.intermediate_size * 2,
     #    config.hidden_size,
     # )
     # self.mlp1_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2)
-    self.ffn_gate_exps_weight = Tensor.zeros(config.num_experts,
-      config.intermediate_size,
-      config.hidden_size)
+    self.ffn_gate_exps_weight = Tensor.zeros(config.num_experts, config.intermediate_size, config.hidden_size)
 
     self.ffn_gate_exps_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
 
-    self.ffn_up_exps_weight = Tensor.zeros(config.num_experts,
-      config.intermediate_size,
-      config.hidden_size)
+    self.ffn_up_exps_weight = Tensor.zeros(config.num_experts, config.intermediate_size, config.hidden_size)
 
     self.ffn_up_exps_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
-
 
     self.mlp2_weight = Tensor.zeros(
       config.num_experts,
@@ -401,7 +396,7 @@ class Transformer:
   ):
     super().__init__()
     self.embedding = nn.Embedding(config.vocab_size, config.hidden_size)
-    self.block = [TransformerBlock(config, layer_idx) for layer_idx in range(2)]
+    self.block = [TransformerBlock(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
     self.norm = nn.RMSNorm(config.hidden_size)
     self.unembedding = nn.Linear(
       config.hidden_size,
@@ -509,58 +504,77 @@ class Transformer:
 
 models = {
   #  "20B": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
-  "20B": "https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF/resolve/main/openai_gpt-oss-20b-Q6_K.gguf",
+  # "20B": "https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF/resolve/main/openai_gpt-oss-20b-Q6_K.gguf",
+  "20B": "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-mxfp4.gguf"
 }
 
 
 def rename_state_dict_keys(state_dict: dict, kv: dict) -> dict:
   # norm.weight
-  state_dict['norm.weight'] = state_dict.pop('output_norm.weight')
-  state_dict['unembedding.weight'] = state_dict.pop('output.weight')
-  state_dict['embedding.weight'] = state_dict.pop('token_embd.weight')
+  state_dict["norm.weight"] = state_dict.pop("output_norm.weight")
+  state_dict["unembedding.weight"] = state_dict.pop("output.weight")
+  state_dict["embedding.weight"] = state_dict.pop("token_embd.weight")
 
-  for i in range(0, kv['gpt-oss.block_count']):
+  for i in range(0, kv["gpt-oss.block_count"]):
     # attention
-    state_dict[f'block.{i}.attn.sinks'] = state_dict.pop(f'blk.{i}.attn_sinks.weight')
-    state_dict[f'block.{i}.attn.norm.weight'] = state_dict.pop(f'blk.{i}.attn_norm.weight')
-
+    state_dict[f"block.{i}.attn.sinks"] = state_dict.pop(f"blk.{i}.attn_sinks.weight")
+    state_dict[f"block.{i}.attn.norm.weight"] = state_dict.pop(f"blk.{i}.attn_norm.weight")
 
     # blk.0.attn.attn_q.weight
-    state_dict[f'block.{i}.attn.attn_q.weight'] = state_dict.pop(f'blk.{i}.attn_q.weight')
-    state_dict[f'block.{i}.attn.attn_q.bias'] = state_dict.pop(f'blk.{i}.attn_q.bias')
-    state_dict[f'block.{i}.attn.attn_k.weight'] = state_dict.pop(f'blk.{i}.attn_k.weight')
-    state_dict[f'block.{i}.attn.attn_k.bias'] = state_dict.pop(f'blk.{i}.attn_k.bias')
-    state_dict[f'block.{i}.attn.attn_v.weight'] = state_dict.pop(f'blk.{i}.attn_v.weight')
-    state_dict[f'block.{i}.attn.attn_v.bias'] = state_dict.pop(f'blk.{i}.attn_v.bias')
+    state_dict[f"block.{i}.attn.attn_q.weight"] = state_dict.pop(f"blk.{i}.attn_q.weight")
+    state_dict[f"block.{i}.attn.attn_q.bias"] = state_dict.pop(f"blk.{i}.attn_q.bias")
+    state_dict[f"block.{i}.attn.attn_k.weight"] = state_dict.pop(f"blk.{i}.attn_k.weight")
+    state_dict[f"block.{i}.attn.attn_k.bias"] = state_dict.pop(f"blk.{i}.attn_k.bias")
+    state_dict[f"block.{i}.attn.attn_v.weight"] = state_dict.pop(f"blk.{i}.attn_v.weight")
+    state_dict[f"block.{i}.attn.attn_v.bias"] = state_dict.pop(f"blk.{i}.attn_v.bias")
     # blk.0.attn_output.weight
-    state_dict[f'block.{i}.attn.out.weight'] = state_dict.pop(f'blk.{i}.attn_output.weight')
-    state_dict[f'block.{i}.attn.out.bias'] = state_dict.pop(f'blk.{i}.attn_output.bias')
+    state_dict[f"block.{i}.attn.out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
+    state_dict[f"block.{i}.attn.out.bias"] = state_dict.pop(f"blk.{i}.attn_output.bias")
 
     # mlp
     # blk.0.mlp.norm.weight
-    state_dict[f'block.{i}.mlp.norm.weight'] = state_dict.pop(f'blk.{i}.post_attention_norm.weight')
+    state_dict[f"block.{i}.mlp.norm.weight"] = state_dict.pop(f"blk.{i}.post_attention_norm.weight")
     # blk.0.mlp.gate.weight
-    state_dict[f'block.{i}.mlp.gate.weight'] = state_dict.pop(f'blk.{i}.ffn_gate_inp.weight')
-    state_dict[f'block.{i}.mlp.gate.bias'] = state_dict.pop(f'blk.{i}.ffn_gate_inp.bias')
+    state_dict[f"block.{i}.mlp.gate.weight"] = state_dict.pop(f"blk.{i}.ffn_gate_inp.weight")
+    state_dict[f"block.{i}.mlp.gate.bias"] = state_dict.pop(f"blk.{i}.ffn_gate_inp.bias")
 
     # blk.0.mlp.mlp1_weight
-    #state_dict[f'block.{i}.mlp.mlp1_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
-    #state_dict[f'block.{i}.mlp.mlp1_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
+    # state_dict[f'block.{i}.mlp.mlp1_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
+    # state_dict[f'block.{i}.mlp.mlp1_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
 
-    #ffn_up_exps
-    state_dict[f'block.{i}.mlp.ffn_up_exps_weight'] = state_dict.pop(f'blk.{i}.ffn_up_exps.weight')
-    state_dict[f'block.{i}.mlp.ffn_up_exps_bias'] = state_dict.pop(f'blk.{i}.ffn_up_exps.bias')
+    # ffn_up_exps
+    state_dict[f"block.{i}.mlp.ffn_up_exps_weight"] = state_dict.pop(f"blk.{i}.ffn_up_exps.weight")
+    state_dict[f"block.{i}.mlp.ffn_up_exps_bias"] = state_dict.pop(f"blk.{i}.ffn_up_exps.bias")
 
     # ffn_gate_exps
-    state_dict[f'block.{i}.mlp.ffn_gate_exps_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
-    state_dict[f'block.{i}.mlp.ffn_gate_exps_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
-
+    state_dict[f"block.{i}.mlp.ffn_gate_exps_weight"] = state_dict.pop(f"blk.{i}.ffn_gate_exps.weight")
+    state_dict[f"block.{i}.mlp.ffn_gate_exps_bias"] = state_dict.pop(f"blk.{i}.ffn_gate_exps.bias")
 
     # blk.0.mlp.mlp2_weight
-    state_dict[f'block.{i}.mlp.mlp2_weight'] = state_dict.pop(f'blk.{i}.ffn_down_exps.weight')
-    state_dict[f'block.{i}.mlp.mlp2_bias'] = state_dict.pop(f'blk.{i}.ffn_down_exps.bias')
+    state_dict[f"block.{i}.mlp.mlp2_weight"] = state_dict.pop(f"blk.{i}.ffn_down_exps.weight")
+    state_dict[f"block.{i}.mlp.mlp2_bias"] = state_dict.pop(f"blk.{i}.ffn_down_exps.bias")
 
   return state_dict
+
+
+def drop_experts(kv: dict, state_dict: dict[str, Tensor], num_experts_to_keep: int) -> None:
+  for i in range(0, kv["gpt-oss.block_count"]):
+    # MLP experts
+    for param_name in [
+      "ffn_gate_exps.weight",
+      "ffn_gate_exps.bias",
+      "ffn_up_exps.weight",
+      "ffn_up_exps.bias",
+      "ffn_down_exps.weight",
+      "ffn_down_exps.bias",
+      "ffn_gate_inp.weight",
+      "ffn_gate_inp.bias",
+    ]:
+      full_param_name = f"blk.{i}.{param_name}"
+      param = state_dict[full_param_name]
+      # use shrink here instead
+      state_dict[full_param_name] = param[:num_experts_to_keep, ...].contiguous()
+      del param
 
 
 if __name__ == "__main__":
@@ -571,13 +585,17 @@ if __name__ == "__main__":
 
   # load the model
   #
+  print(GlobalCounters.mem_used)
   kv, state_dict = nn.state.gguf_load(Tensor.from_url(models[args.size]).to(None))
+  print(GlobalCounters.mem_used)
 
   model_config = build_config_from_kv(kv)
-
+  drop_experts(kv, state_dict, num_experts_to_keep=16)
+  model_config.num_experts = 16
   model = Transformer(model_config)
 
   nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, kv))
+  print(GlobalCounters.mem_used)
 
   # extract some metadata
   tok = SimpleTokenizer.from_gguf_kv(kv)
