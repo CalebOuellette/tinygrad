@@ -321,7 +321,7 @@ class MLPBlock:
     self.gate = nn.Linear(config.hidden_size, config.num_experts)
 
     # the model weights loaded from GGUF are already split into ffn_up and ffn_gate experts
-    # self.mlp1_weight = Tensor.zeros( 
+    # self.mlp1_weight = Tensor.zeros(
     #    config.num_experts,
     #    config.intermediate_size * 2,
     #    config.hidden_size,
@@ -590,13 +590,12 @@ if __name__ == "__main__":
   print(GlobalCounters.mem_used)
 
   model_config = build_config_from_kv(kv)
-  drop_experts(kv, state_dict, num_experts_to_keep=16)
-  model_config.num_experts = 16
   model = Transformer(model_config)
 
   nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, kv))
   print(GlobalCounters.mem_used)
 
+  # TODO SETUP new tokenizer
   # extract some metadata
   tok = SimpleTokenizer.from_gguf_kv(kv)
   bos_id: int = kv["tokenizer.ggml.bos_token_id"]
