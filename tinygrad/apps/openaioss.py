@@ -544,8 +544,7 @@ def main():
   model_config = build_config_from_kv(kv)
   model = Transformer(model_config)
 
-  nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, kv))
-  print(GlobalCounters.mem_used)
+  nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, kv), realize=False)
 
   # TODO SETUP new tokenizer
   # extract some metadata

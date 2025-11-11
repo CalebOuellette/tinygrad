@@ -308,15 +308,16 @@ def ggml_data_to_tensor(t: Tensor, n: int, ggml_type: int) -> Tensor:
       return d * (xl.bitwise_or(xh).bitcast(dtypes.int8) - 32).flatten(-2) * scales
     if ggml_type == 39:
       e_int = blocks[:, 0].cast(dtypes.int32).realize()
-      d = ((e_int >= 2).cast(dtypes.float16) * (e_int.cast(dtypes.float16) - 128).exp2() +
-           (e_int == 1).cast(dtypes.float16) * 2.0**(-127) +
-           (e_int == 0).cast(dtypes.float16) * 2.0**(-128)).unsqueeze(-1)
+      d = ((e_int >= 2).cast(dtypes.float32) * (e_int.cast(dtypes.float32) - 128).exp2() +
+           (e_int == 1).cast(dtypes.float32) * 2.0**(-127) +
+           (e_int == 0).cast(dtypes.float32) * 2.0**(-128)).unsqueeze(-1)
       codes = q_to_uint8(blocks[:, 1:17], 4)
-      sign = 1.0 - codes.rshift(3).cast(dtypes.float16) * 2.0
-      exp, mant = codes.rshift(1).bitwise_and(0x3).cast(dtypes.float16), codes.bitwise_and(0x1).cast(dtypes.float16)
-      fp4_val = sign * ((exp != 0).cast(dtypes.float16) * (1.0 + 0.5 * mant) * (exp - 1.0).exp2() +
-                        (exp == 0).cast(dtypes.float16) * 0.5 * mant)
-      return (fp4_val * d).flatten(-2)[:n]
+      sign = 1.0 - codes.rshift(3).cast(dtypes.float32) * 2.0
+      exp, mant = codes.rshift(1).bitwise_and(0x3).cast(dtypes.float32), codes.bitwise_and(0x1).cast(dtypes.float32)
+      fp4_val = sign * ((exp != 0).cast(dtypes.float32) * (1.0 + 0.5 * mant) * (exp - 1.0).exp2() +
+                        (exp == 0).cast(dtypes.float32) * 0.5 * mant)
+      final = (fp4_val * d).flatten(-2)[:n]
+      return final
   raise ValueError(f"GGML type '{ggml_type}' is not supported!")
 
 @accept_filename
