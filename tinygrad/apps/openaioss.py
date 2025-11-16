@@ -2,9 +2,13 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+from pathlib import Path
 from typing import Tuple
 import sys, argparse
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv
+
+
+from tinygrad import Tensor, nn, UOp, TinyJit, getenv, dtypes
+from tinygrad.dtype import DType
 from tinygrad.helpers import GlobalCounters
 
 
@@ -34,7 +38,7 @@ REASONING_EFFORT = {
 @dataclass
 class ModelConfig:
   num_hidden_layers: int = 36  # block_count
-  num_experts: int = 28  # exper_count
+  num_experts: int = 32  # exper_count
   experts_per_token: int = 4  # expert_used_count
   vocab_size: int = 201088  # ??
   hidden_size: int = 2880  #
@@ -280,29 +284,21 @@ class MLPBlock:
     self.gate = nn.Linear(config.hidden_size, config.num_experts)
 
     # the model weights loaded from GGUF are already split into ffn_up and ffn_gate experts
-    # self.mlp1_weight = Tensor.zeros(
-    #    config.num_experts,
-    #    config.intermediate_size * 2,
-    #    config.hidden_size,
-    # )
-    # self.mlp1_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2)
-    self.ffn_gate_exps_weight = Tensor.zeros(config.num_experts, config.intermediate_size, config.hidden_size)
-
-    self.ffn_gate_exps_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
-
-    self.ffn_up_exps_weight = Tensor.zeros(config.num_experts, config.intermediate_size, config.hidden_size)
-
-    self.ffn_up_exps_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
-
-    self.mlp2_weight = Tensor.zeros(
-      config.num_experts,
-      config.hidden_size,
-      config.intermediate_size,
+    self.gate_up_proj = Tensor.zeros(
+       config.num_experts,
+       config.intermediate_size * 2,
+       90, 16
     )
-    self.mlp2_bias = Tensor.zeros(
-      config.num_experts,
-      config.hidden_size,
+    self.gate_up_proj_bias = Tensor.zeros(config.num_experts, config.intermediate_size * 2)
+    self.gate_up_proj_scales = Tensor.zeros(config.num_experts, config.intermediate_size * 2, 90)
+
+    self.down_proj = Tensor.zeros(
+       config.num_experts,
+       config.intermediate_size,
+       90,16
     )
+    self.down_proj_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
+    self.down_proj_scales = Tensor.zeros(config.num_experts, config.intermediate_size, 90)
 
   def __call__(self, x: Tensor) -> Tensor:
     t = self.norm(x)
@@ -310,20 +306,23 @@ class MLPBlock:
     expert_values, expert_indices = g.topk(k=self.experts_per_token, dim=-1)
     expert_weights = expert_values.softmax(1)
 
-    mlp1_weight_combined = self.ffn_up_exps_weight.cat(self.ffn_gate_exps_weight, dim=1)
-    mlp1_bias_combined = self.ffn_up_exps_bias.cat(self.ffn_gate_exps_bias, dim=1)
+    mlp1_weights = _get_mxfp4_tensor_copy(self.gate_up_proj, self.gate_up_proj_scales)
+
 
     # MLP #1
-    mlp1_weight = mlp1_weight_combined[expert_indices, ...].squeeze(0)
-    mlp1_bias = mlp1_bias_combined[expert_indices, ...].squeeze(0)
-    t = Tensor.einsum("beck,bk->bec", mlp1_weight, t.squeeze(0)) + mlp1_bias
+    mlp1_weight_exp = mlp1_weights[expert_indices, ...]
+    mlp1_bias_exp = self.gate_up_proj_bias[expert_indices, ...]
+    t = Tensor.einsum("beck,bk->bec", mlp1_weight_exp.squeeze(0), t.squeeze(0))
+    t += mlp1_bias_exp.squeeze(0)
     t = swiglu(t, limit=self.swiglu_limit)
 
+    mlp2_weights = _get_mxfp4_tensor_copy(self.down_proj, self.down_proj_scales)
+
     # MLP #2
-    mlp2_weight = self.mlp2_weight[expert_indices, ...].squeeze(0)
-    mlp2_bias = self.mlp2_bias[expert_indices, ...].squeeze(0)
-    t = Tensor.einsum("beck,bek->bec", mlp2_weight, t.squeeze(0))
-    t += mlp2_bias
+    mlp2_weight = mlp2_weights[expert_indices, ...]
+    mlp2_bias = self.down_proj_bias[expert_indices, ...]
+    t = Tensor.einsum("beck,bek->bec", mlp2_weight.squeeze(0), t.squeeze(0))
+    t += mlp2_bias.squeeze(0)
 
     # Weighted sum of experts
     t = Tensor.einsum("bec,be->bc", t, expert_weights.squeeze(0))
@@ -388,163 +387,69 @@ class Transformer:
   def __call__(self, tokens: Tensor, start_pos: int | UOp = 0) -> Tensor:
     return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens)
 
-  @staticmethod
-  def from_checkpoint(path: str) -> "Transformer":
-    config_path = os.path.join(path, "config.json")
-    with open(config_path, "r") as f:
-      json_config = json.load(f)
-      config = ModelConfig(**json_config)
-
-    model = Transformer(
-      config=config,
-    )
-    model.eval()
-
-    # Load weights
-    my_rank = dist.get_rank() if dist.is_initialized() else 0
-    world_size = dist.get_world_size() if dist.is_initialized() else 1
-    per_rank_intermediate_size = config.intermediate_size // world_size
-
-    checkpoint = Checkpoint(path, device)
-
-    for name, param in model.named_parameters():
-      loaded_tensor = checkpoint.get(name)
-
-      # Note: it would be more efficient to do sharding before upcasting from MXFP4,
-      # but for simplicity we do it after.
-      if "mlp1" in name:  # both weight and bias
-        loaded_tensor = loaded_tensor[
-          :,
-          my_rank * 2 * per_rank_intermediate_size : (my_rank + 1) * 2 * per_rank_intermediate_size,
-          ...,
-        ]
-      elif "mlp2_weight" in name:  # only weight
-        loaded_tensor = loaded_tensor[
-          ...,
-          my_rank * per_rank_intermediate_size : (my_rank + 1) * per_rank_intermediate_size,
-        ]
-      try:
-        param.data.copy_(loaded_tensor)
-      except:
-        print(f"{name=} {param.data.shape=} {loaded_tensor.shape=}")
-        raise
-
-    return model
-
-
-# class TokenGenerator:
-#   def __init__(self, checkpoint: str, device: torch.device):
-#     self.device = device
-#     self.model = Transformer.from_checkpoint(checkpoint, device=self.device)
-
-#   def generate(self, prompt_tokens: list[int], stop_tokens: list[int], temperature: float = 1.0, max_tokens: int = 0, return_logprobs: bool = False):
-#     tokens = list(prompt_tokens)
-#     num_generated_tokens = 0
-#     while max_tokens == 0 or num_generated_tokens < max_tokens:
-#       logits = self.model(torch.as_tensor(tokens, dtype=torch.int32, device=self.device))[-1]
-#       if temperature == 0.0:
-#         predicted_token = torch.argmax(logits, dim=-1).item()
-#       else:
-#         probs = torch.softmax(logits * (1.0 / temperature), dim=-1)
-#         predicted_token = torch.multinomial(probs, num_samples=1).item()
-#       tokens.append(predicted_token)
-#       num_generated_tokens += 1
-
-#       if return_logprobs:
-#         logprobs = torch.log_softmax(logits, dim=-1)
-#         selected_logprobs = logprobs[predicted_token].item()
-#         yield predicted_token, selected_logprobs
-#       else:
-#         yield predicted_token
-
-#       if predicted_token in stop_tokens:
-#         break
-
-
 models = {
-  #  "20B": "https://huggingface.co/bartowski/Llama-3.2-1B-Instruct-GGUF/resolve/main/Llama-3.2-1B-Instruct-Q6_K.gguf",
-  # "20B": "https://huggingface.co/bartowski/openai_gpt-oss-20b-GGUF/resolve/main/openai_gpt-oss-20b-Q6_K.gguf",
   "20B": "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-mxfp4.gguf"
 }
 
 
-def rename_state_dict_keys(state_dict: dict, kv: dict) -> dict:
+def rename_state_dict_keys(state_dict: dict, layers: int) -> dict:
   # norm.weight
-  state_dict["norm.weight"] = state_dict.pop("output_norm.weight")
-  state_dict["unembedding.weight"] = state_dict.pop("output.weight")
-  state_dict["embedding.weight"] = state_dict.pop("token_embd.weight")
+  state_dict["norm.weight"] = state_dict.pop("model.norm.weight")
+  state_dict["unembedding.weight"] = state_dict.pop("lm_head.weight")
+  state_dict["embedding.weight"] = state_dict.pop("model.embed_tokens.weight")
 
-  for i in range(0, kv["gpt-oss.block_count"]):
+  for i in range(0, layers):
     # attention
-    state_dict[f"block.{i}.attn.sinks"] = state_dict.pop(f"blk.{i}.attn_sinks.weight")
-    state_dict[f"block.{i}.attn.norm.weight"] = state_dict.pop(f"blk.{i}.attn_norm.weight")
+    state_dict[f"block.{i}.attn.sinks"] = state_dict.pop(f"model.layers.{i}.self_attn.sinks")
+    state_dict[f"block.{i}.attn.norm.weight"] = state_dict.pop(f"model.layers.{i}.input_layernorm.weight")
 
     # blk.0.attn.attn_q.weight
-    state_dict[f"block.{i}.attn.attn_q.weight"] = state_dict.pop(f"blk.{i}.attn_q.weight")
-    state_dict[f"block.{i}.attn.attn_q.bias"] = state_dict.pop(f"blk.{i}.attn_q.bias")
-    state_dict[f"block.{i}.attn.attn_k.weight"] = state_dict.pop(f"blk.{i}.attn_k.weight")
-    state_dict[f"block.{i}.attn.attn_k.bias"] = state_dict.pop(f"blk.{i}.attn_k.bias")
-    state_dict[f"block.{i}.attn.attn_v.weight"] = state_dict.pop(f"blk.{i}.attn_v.weight")
-    state_dict[f"block.{i}.attn.attn_v.bias"] = state_dict.pop(f"blk.{i}.attn_v.bias")
-    # blk.0.attn_output.weight
-    state_dict[f"block.{i}.attn.out.weight"] = state_dict.pop(f"blk.{i}.attn_output.weight")
-    state_dict[f"block.{i}.attn.out.bias"] = state_dict.pop(f"blk.{i}.attn_output.bias")
+    state_dict[f"block.{i}.attn.attn_q.weight"] = state_dict.pop(f"model.layers.{i}.self_attn.q_proj.weight")
+    state_dict[f"block.{i}.attn.attn_q.bias"] = state_dict.pop(f"model.layers.{i}.self_attn.q_proj.bias")
+    state_dict[f"block.{i}.attn.attn_k.weight"] = state_dict.pop(f"model.layers.{i}.self_attn.k_proj.weight")
+    state_dict[f"block.{i}.attn.attn_k.bias"] = state_dict.pop(f"model.layers.{i}.self_attn.k_proj.bias")
+    state_dict[f"block.{i}.attn.attn_v.weight"] = state_dict.pop(f"model.layers.{i}.self_attn.v_proj.weight")
+    state_dict[f"block.{i}.attn.attn_v.bias"] = state_dict.pop(f"model.layers.{i}.self_attn.v_proj.bias")
+    # model.layers.0.atself_attn.t.weight
+    state_dict[f"block.{i}.attn.out.weight"] = state_dict.pop(f"model.layers.{i}.self_attn.o_proj.weight")
+    state_dict[f"block.{i}.attn.out.bias"] = state_dict.pop(f"model.layers.{i}.self_attn.o_proj.bias")
 
     # mlp
-    # blk.0.mlp.norm.weight
-    state_dict[f"block.{i}.mlp.norm.weight"] = state_dict.pop(f"blk.{i}.post_attention_norm.weight")
-    # blk.0.mlp.gate.weight
-    state_dict[f"block.{i}.mlp.gate.weight"] = state_dict.pop(f"blk.{i}.ffn_gate_inp.weight")
-    state_dict[f"block.{i}.mlp.gate.bias"] = state_dict.pop(f"blk.{i}.ffn_gate_inp.bias")
+    # model.layers.0.mlp.norm.weight
+    state_dict[f"block.{i}.mlp.norm.weight"] = state_dict.pop(f"model.layers.{i}.post_attention_layernorm.weight")
+    # model.layers.0.mlp.gate.weight
+    state_dict[f"block.{i}.mlp.gate.weight"] = state_dict.pop(f"model.layers.{i}.mlp.router.weight")
+    state_dict[f"block.{i}.mlp.gate.bias"] = state_dict.pop(f"model.layers.{i}.mlp.router.bias")
 
-    # blk.0.mlp.mlp1_weight
-    # state_dict[f'block.{i}.mlp.mlp1_weight'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.weight')
-    # state_dict[f'block.{i}.mlp.mlp1_bias'] = state_dict.pop(f'blk.{i}.ffn_gate_exps.bias')
+    # model.layers.0.mlp.mlp1_weight
+    # state_dict[f'block.{i}.mlp.mlp1_weight'] = state_dict.pop(f'model.layers.{i}.ffn_gate_exps.weight')
+    # state_dict[f'block.{i}.mlp.mlp1_bias'] = state_dict.pop(f'model.layers.{i}.ffn_gate_exps.bias')
 
     # ffn_up_exps
-    state_dict[f"block.{i}.mlp.ffn_up_exps_weight"] = state_dict.pop(f"blk.{i}.ffn_up_exps.weight")
-    state_dict[f"block.{i}.mlp.ffn_up_exps_bias"] = state_dict.pop(f"blk.{i}.ffn_up_exps.bias")
+    state_dict[f"block.{i}.mlp.gate_up_proj"] = state_dict.pop(f"model.layers.{i}.mlp.experts.gate_up_proj_blocks")
+    state_dict[f"block.{i}.mlp.gate_up_proj_bias"] = state_dict.pop(f"model.layers.{i}.mlp.experts.gate_up_proj_bias")
+    state_dict[f"block.{i}.mlp.gate_up_proj_scales"] = state_dict.pop(f"model.layers.{i}.mlp.experts.gate_up_proj_scales")
 
-    # ffn_gate_exps
-    state_dict[f"block.{i}.mlp.ffn_gate_exps_weight"] = state_dict.pop(f"blk.{i}.ffn_gate_exps.weight")
-    state_dict[f"block.{i}.mlp.ffn_gate_exps_bias"] = state_dict.pop(f"blk.{i}.ffn_gate_exps.bias")
-
-    # blk.0.mlp.mlp2_weight
-    state_dict[f"block.{i}.mlp.mlp2_weight"] = state_dict.pop(f"blk.{i}.ffn_down_exps.weight")
-    state_dict[f"block.{i}.mlp.mlp2_bias"] = state_dict.pop(f"blk.{i}.ffn_down_exps.bias")
+    # model.layers.0.mlp.mlp2_weight
+    state_dict[f"block.{i}.mlp.down_proj"] = state_dict.pop(f"model.layers.{i}.mlp.experts.down_proj_blocks")
+    state_dict[f"block.{i}.mlp.down_proj_bias"] = state_dict.pop(f"model.layers.{i}.mlp.experts.down_proj_bias")
+    state_dict[f"block.{i}.mlp.down_proj_scales"] = state_dict.pop(f"model.layers.{i}.mlp.experts.down_proj_scales")
 
   return state_dict
 
-
-def drop_experts(kv: dict, state_dict: dict[str, Tensor], num_experts_to_keep: int) -> None:
-  for i in range(0, kv["gpt-oss.block_count"]):
-    # MLP experts
-    for param_name in [
-      "ffn_gate_exps.weight",
-      "ffn_gate_exps.bias",
-      "ffn_up_exps.weight",
-      "ffn_up_exps.bias",
-      "ffn_down_exps.weight",
-      "ffn_down_exps.bias",
-      "ffn_gate_inp.weight",
-      "ffn_gate_inp.bias",
-    ]:
-      full_param_name = f"blk.{i}.{param_name}"
-      param = state_dict[full_param_name]
-      # use shrink here instead
-      state_dict[full_param_name] = param[:num_experts_to_keep, ...].contiguous()
-      del param
-
-
 def main():
-  print(GlobalCounters.mem_used)
-  kv, state_dict = nn.state.gguf_load(Tensor.from_url(models["20B"]).to(None))
-  print(GlobalCounters.mem_used)
 
-  model_config = build_config_from_kv(kv)
+  path = Path('/Users/calebouellette/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee')
+  # kv, state_dict = nn.state.gguf_load(Tensor.from_url(models["20B"]).to(None))
+  state_dict = nn.state.safe_load(path.joinpath('model-00000-of-00002.safetensors'))
+  state_dict = state_dict | nn.state.safe_load(path.joinpath('model-00001-of-00002.safetensors'))
+  state_dict = state_dict | nn.state.safe_load(path.joinpath('model-00002-of-00002.safetensors'))
+
+  model_config = ModelConfig() # TODO Load
+  model_config.num_hidden_layers = 2
   model = Transformer(model_config)
 
-  nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, kv), realize=False)
+  nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, model_config.num_hidden_layers), realize=False)
 
   # TODO SETUP new tokenizer
   # extract some metadata
@@ -561,8 +466,8 @@ def main():
   conversation = Conversation.from_messages(messages)
   tokens = encoding.render_conversation(conversation)
 
-  bos_id: int = kv["tokenizer.ggml.bos_token_id"]
-  eos_id: int = kv["tokenizer.ggml.eos_token_id"]
+  bos_id: int = 123 # kv["tokenizer.ggml.bos_token_id"]
+  eos_id: int = 123 # kv["tokenizer.ggml.eos_token_id"]
 
   ids: list[int] = [bos_id]
   while 1:
@@ -573,3 +478,26 @@ def main():
       if next_id == eos_id:
         break
 
+
+FP4_VALUES = [
+    +0.0, +0.5, +1.0, +1.5, +2.0, +3.0, +4.0, +6.0,
+    -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
+]
+
+def _get_mxfp4_tensor_copy(loaded_blocks: Tensor, loaded_scales: Tensor, dtype: DType = dtypes.bfloat16):
+    # Split it into low and high nibbles, upcast to bytes, and interleave (for swiglu)
+    loaded_blocks_lo = loaded_blocks & 0x0F
+    loaded_blocks_hi = loaded_blocks >> 4
+    loaded_blocks = loaded_blocks_lo.stack(( loaded_blocks_hi), dim=-1)
+    loaded_blocks = loaded_blocks.view(*loaded_blocks.shape[:-2], loaded_blocks.shape[-2] * 2)
+
+    # Upcast to int32 and subtract bias
+    loaded_scales = loaded_scales.int() - 127
+
+    # Convert MXFP4 numbers into target dtype
+    fp4_values = Tensor(FP4_VALUES, dtype=dtype)
+
+    exp = Tensor([2.0]).pow(loaded_scales.unsqueeze(-1))
+    loaded_tensor = fp4_values[loaded_blocks.int()] * exp
+    loaded_tensor = loaded_tensor.view(*loaded_tensor.shape[:-2], -1)
+    return loaded_tensor
