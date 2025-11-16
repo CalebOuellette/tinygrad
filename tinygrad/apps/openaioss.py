@@ -446,10 +446,9 @@ def main():
   state_dict = state_dict | nn.state.safe_load(path.joinpath('model-00002-of-00002.safetensors'))
 
   model_config = ModelConfig() # TODO Load
-  model_config.num_hidden_layers = 10
   model = Transformer(model_config)
 
-  nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, model_config.num_hidden_layers), realize=False)
+  nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, model_config.num_hidden_layers))
 
   # TODO SETUP new tokenizer
   # extract some metadata
@@ -484,25 +483,6 @@ FP4_VALUES = [
     -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0,
 ]
 
-def _get_mxfp4_tensor_copy(loaded_blocks: Tensor, loaded_scales: Tensor, dtype: DType = dtypes.bfloat16):
-    # Split it into low and high nibbles, upcast to bytes, and interleave (for swiglu)
-    loaded_blocks_lo = loaded_blocks & 0x0F
-    loaded_blocks_hi = loaded_blocks >> 4
-    loaded_blocks = loaded_blocks_lo.stack(( loaded_blocks_hi), dim=-1)
-    loaded_blocks = loaded_blocks.view(*loaded_blocks.shape[:-2], loaded_blocks.shape[-2] * 2)
-
-    # Upcast to int32 and subtract bias
-    loaded_scales = loaded_scales.int() - 127
-
-    # Convert MXFP4 numbers into target dtype
-    fp4_values = Tensor(FP4_VALUES, dtype=dtype)
-
-    exp = Tensor([2.0]).pow(loaded_scales.unsqueeze(-1))
-    loaded_tensor = fp4_values[loaded_blocks.int()] * exp
-    loaded_tensor = loaded_tensor.view(*loaded_tensor.shape[:-2], -1)
-    return loaded_tensor
-
-
 def _get_mxfp4_tensor(
     blocks: Tensor,
     scales: Tensor,
@@ -524,7 +504,7 @@ def _get_mxfp4_tensor(
     blocks = blocks.reshape(rows_total, B)
     scales = scales.reshape(rows_total, 1)
 
-    out = Tensor.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
+    out = Tensor.empty(rows_total, B * 2, dtype=dtype)
 
     for r0 in range(0, rows_total, rows_per_chunk):
         r1 = min(r0 + rows_per_chunk, rows_total)
