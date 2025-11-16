@@ -37,7 +37,7 @@ REASONING_EFFORT = {
 
 @dataclass
 class ModelConfig:
-  num_hidden_layers: int = 36  # block_count
+  num_hidden_layers: int = 24  # block_count
   num_experts: int = 32  # exper_count
   experts_per_token: int = 4  # expert_used_count
   vocab_size: int = 201088  # ??
@@ -306,7 +306,7 @@ class MLPBlock:
     expert_values, expert_indices = g.topk(k=self.experts_per_token, dim=-1)
     expert_weights = expert_values.softmax(1)
 
-    mlp1_weights = _get_mxfp4_tensor_copy(self.gate_up_proj, self.gate_up_proj_scales)
+    mlp1_weights = _get_mxfp4_tensor(self.gate_up_proj, self.gate_up_proj_scales)
 
 
     # MLP #1
@@ -316,7 +316,7 @@ class MLPBlock:
     t += mlp1_bias_exp.squeeze(0)
     t = swiglu(t, limit=self.swiglu_limit)
 
-    mlp2_weights = _get_mxfp4_tensor_copy(self.down_proj, self.down_proj_scales)
+    mlp2_weights = _get_mxfp4_tensor(self.down_proj, self.down_proj_scales)
 
     # MLP #2
     mlp2_weight = mlp2_weights[expert_indices, ...]
@@ -446,7 +446,7 @@ def main():
   state_dict = state_dict | nn.state.safe_load(path.joinpath('model-00002-of-00002.safetensors'))
 
   model_config = ModelConfig() # TODO Load
-  model_config.num_hidden_layers = 2
+  model_config.num_hidden_layers = 10
   model = Transformer(model_config)
 
   nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, model_config.num_hidden_layers), realize=False)
@@ -501,3 +501,48 @@ def _get_mxfp4_tensor_copy(loaded_blocks: Tensor, loaded_scales: Tensor, dtype: 
     loaded_tensor = fp4_values[loaded_blocks.int()] * exp
     loaded_tensor = loaded_tensor.view(*loaded_tensor.shape[:-2], -1)
     return loaded_tensor
+
+
+def _get_mxfp4_tensor(
+    blocks: Tensor,
+    scales: Tensor,
+    *,
+    dtype: DType = dtypes.bfloat16,
+    rows_per_chunk: int = 16384 * 512,
+) -> Tensor:
+
+
+    assert blocks.shape[:-1] == scales.shape, (
+        f"{blocks.shape=} does not match {scales.shape=}"
+    )
+
+    lut = Tensor(FP4_VALUES, dtype=dtype, device=blocks.device)
+
+    *prefix_shape, G, B = blocks.shape
+    rows_total   = math.prod(prefix_shape) * G
+
+    blocks = blocks.reshape(rows_total, B)
+    scales = scales.reshape(rows_total, 1)
+
+    out = Tensor.empty(rows_total, B * 2, dtype=dtype, device=blocks.device)
+
+    for r0 in range(0, rows_total, rows_per_chunk):
+        r1 = min(r0 + rows_per_chunk, rows_total)
+
+        blk = blocks[r0:r1]
+        exp = scales[r0:r1]
+
+        # nibble indices -> int64
+        idx_lo = (blk & 0x0F).cast(dtypes.long)
+        idx_hi = (blk >> 4).cast(dtypes.long)
+
+        sub = out[r0:r1].contiguous()
+        sub[:, 0::2] = lut[idx_lo]
+        sub[:, 1::2] = lut[idx_hi]
+
+        # torch.ldexp(sub, exp, out=sub)
+        exp = Tensor([2.0]).pow(exp.unsqueeze(-1))
+        sub = sub * exp
+        del idx_lo, idx_hi, blk, exp
+
+    return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
