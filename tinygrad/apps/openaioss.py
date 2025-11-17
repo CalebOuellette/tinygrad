@@ -300,28 +300,32 @@ class MLPBlock:
     self.down_proj_bias = Tensor.zeros(config.num_experts, config.intermediate_size)
     self.down_proj_scales = Tensor.zeros(config.num_experts, config.intermediate_size, 90)
 
+    #self.mlp1_weights = Tensor.zeros(config.num_experts, config.intermediate_size * 2, config.intermediate_size)
+    #self.mlp2_weights = Tensor.zeros(config.num_experts, config.intermediate_size, config.intermediate_size)
+
+  def build_layers(self):
+    self.mlp1_weights = _get_mxfp4_tensor(self.gate_up_proj, self.gate_up_proj_scales)
+    self.mlp2_weights = _get_mxfp4_tensor(self.down_proj, self.down_proj_scales)
+
+
   def __call__(self, x: Tensor) -> Tensor:
     t = self.norm(x)
     g = self.gate(t)
     expert_values, expert_indices = g.topk(k=self.experts_per_token, dim=-1)
     expert_weights = expert_values.softmax(1)
 
-    mlp1_weights = _get_mxfp4_tensor(self.gate_up_proj, self.gate_up_proj_scales)
-
-
     # MLP #1
-    mlp1_weight_exp = mlp1_weights[expert_indices, ...]
+    mlp1_weight_exp = self.mlp1_weights[expert_indices, ...]
     mlp1_bias_exp = self.gate_up_proj_bias[expert_indices, ...]
     t = Tensor.einsum("beck,bk->bec", mlp1_weight_exp.squeeze(0), t.squeeze(0))
     t += mlp1_bias_exp.squeeze(0)
     t = swiglu(t, limit=self.swiglu_limit)
 
-    mlp2_weights = _get_mxfp4_tensor(self.down_proj, self.down_proj_scales)
 
     # MLP #2
-    mlp2_weight = mlp2_weights[expert_indices, ...]
+    mlp2_weight_sliced = self.mlp2_weights[expert_indices, ...]
     mlp2_bias = self.down_proj_bias[expert_indices, ...]
-    t = Tensor.einsum("beck,bek->bec", mlp2_weight.squeeze(0), t.squeeze(0))
+    t = Tensor.einsum("beck,bek->bec", mlp2_weight_sliced.squeeze(0), t.squeeze(0))
     t += mlp2_bias.squeeze(0)
 
     # Weighted sum of experts
@@ -365,27 +369,31 @@ class Transformer:
     self.forward_jit = TinyJit(self.forward)
     self.max_context = 2048
 
+  def build_layers(self):
+    for block in self.block:
+      block.mlp.build_layers()
+
   def forward(self, x: Tensor) -> Tensor:
     x = self.embedding(x)
     for block in self.block:
       x = block(x)
     x = self.norm(x)
     x = self.unembedding(x)
-    return x
+    out = x[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+    return out
 
   def generate(self, tokens: list[int], start_pos=0):
     start_pos = 0
     while len(tokens) < self.max_context:
       t = Tensor([tokens], dtype="int32")
-      output = self(t, start_pos)
-      out = output[:, -1, :].softmax(-1, dtype="float").argmax(-1, keepdim=True)
+      out = self(t, start_pos)
       next_id = int(out.item())
       tokens.append(next_id)
       start_pos = len(tokens) - 1
       yield next_id
 
   def __call__(self, tokens: Tensor, start_pos: int | UOp = 0) -> Tensor:
-    return (self.forward_jit if getenv("JIT", 1) and tokens.shape[1] == 1 and isinstance(start_pos, UOp) else self.forward)(tokens)
+    return self.forward_jit(tokens)
 
 models = {
   "20B": "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-mxfp4.gguf"
@@ -440,7 +448,6 @@ def rename_state_dict_keys(state_dict: dict, layers: int) -> dict:
 def main():
 
   path = Path('/Users/calebouellette/.cache/huggingface/hub/models--openai--gpt-oss-20b/snapshots/6cee5e81ee83917806bbde320786a8fb61efebee')
-  # kv, state_dict = nn.state.gguf_load(Tensor.from_url(models["20B"]).to(None))
   state_dict = nn.state.safe_load(path.joinpath('model-00000-of-00002.safetensors'))
   state_dict = state_dict | nn.state.safe_load(path.joinpath('model-00001-of-00002.safetensors'))
   state_dict = state_dict | nn.state.safe_load(path.joinpath('model-00002-of-00002.safetensors'))
@@ -449,9 +456,7 @@ def main():
   model = Transformer(model_config)
 
   nn.state.load_state_dict(model, rename_state_dict_keys(state_dict, model_config.num_hidden_layers))
-
-  # TODO SETUP new tokenizer
-  # extract some metadata
+  model.build_layers()
 
   encoding = load_harmony_encoding(HarmonyEncodingName.HARMONY_GPT_OSS)
 
@@ -465,16 +470,14 @@ def main():
   conversation = Conversation.from_messages(messages)
   tokens = encoding.render_conversation(conversation)
 
-  bos_id: int = 123 # kv["tokenizer.ggml.bos_token_id"]
-  eos_id: int = 123 # kv["tokenizer.ggml.eos_token_id"]
+  # load generation_config.json from path
 
-  ids: list[int] = [bos_id]
   while 1:
-    start_pos = len(ids) - 1
+    start_pos = len(tokens) - 1
     for next_id in model.generate(tokens, start_pos):
-      sys.stdout.write(encoding.decode([next_id]) if next_id != eos_id else "\n\n")
+      sys.stdout.write(encoding.decode([next_id]))
       sys.stdout.flush()
-      if next_id == eos_id:
+      if next_id == 123: # TODO fix
         break
 
 
@@ -522,7 +525,7 @@ def _get_mxfp4_tensor(
 
         # torch.ldexp(sub, exp, out=sub)
         exp = Tensor([2.0]).pow(exp.unsqueeze(-1))
-        sub = sub * exp
+        sub = sub * exp # seems like we should be assigning to out
         del idx_lo, idx_hi, blk, exp
 
     return out.reshape(*prefix_shape, G, B * 2).view(*prefix_shape, G * B * 2)
