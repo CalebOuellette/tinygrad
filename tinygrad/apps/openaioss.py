@@ -4,27 +4,20 @@ from dataclasses import dataclass
 
 from pathlib import Path
 from typing import Tuple
-import sys, argparse
+import sys
 
 
-from tinygrad import Tensor, nn, UOp, TinyJit, getenv, dtypes
+from tinygrad import Tensor, nn, UOp, TinyJit,  dtypes
 from tinygrad.dtype import DType
-from tinygrad.helpers import GlobalCounters
 
 
 from openai_harmony import (
-    Author,
     Conversation,
-    DeveloperContent,
     HarmonyEncodingName,
     Message,
     ReasoningEffort,
     Role,
-    StreamableParser,
-    StreamState,
     SystemContent,
-    TextContent,
-    ToolDescription,
     load_harmony_encoding,
 )
 
@@ -383,9 +376,11 @@ class Transformer:
     return out
 
   def generate(self, tokens: list[int], start_pos=0):
+    v_start_pos = UOp.variable("start_pos", 1, self.max_context-1)
     start_pos = 0
+    t = Tensor([tokens[start_pos:]], dtype="int32")
+    # self.forward_jit.reset()  # TODO: why is this required? root cause the issue and make it not be needed
     while len(tokens) < self.max_context:
-      t = Tensor([tokens], dtype="int32")
       out = self(t, start_pos)
       next_id = int(out.item())
       tokens.append(next_id)
