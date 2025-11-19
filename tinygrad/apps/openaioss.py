@@ -381,6 +381,7 @@ class Transformer:
     t = Tensor([tokens[start_pos:]], dtype="int32")
     # self.forward_jit.reset()  # TODO: why is this required? root cause the issue and make it not be needed
     while len(tokens) < self.max_context:
+      t = Tensor([tokens], dtype="int32")
       out = self(t, start_pos)
       next_id = int(out.item())
       tokens.append(next_id)
@@ -388,7 +389,7 @@ class Transformer:
       yield next_id
 
   def __call__(self, tokens: Tensor, start_pos: int | UOp = 0) -> Tensor:
-    return self.forward_jit(tokens)
+    return self.forward(tokens)
 
 models = {
   "20B": "https://huggingface.co/ggml-org/gpt-oss-20b-GGUF/resolve/main/gpt-oss-20b-mxfp4.gguf"
@@ -461,9 +462,11 @@ def main():
   )
 
   system_message = Message.from_role_and_content(Role.SYSTEM, system_message_content)
-  messages = [system_message]
+  user_message = Message.from_role_and_content(Role.USER, "hi how are you?")
+  messages = [system_message, user_message]
   conversation = Conversation.from_messages(messages)
   tokens = encoding.render_conversation(conversation)
+  sys.stdout.write(encoding.decode(tokens))
 
   # load generation_config.json from path
 
