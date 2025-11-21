@@ -178,7 +178,7 @@ models = {
   "8B": "https://huggingface.co/bartowski/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q8_0.gguf",
 }
 
-if __name__ == "__main__":
+def main():
   parser = argparse.ArgumentParser()
   parser.add_argument("--size", choices=list(models.keys()), default=list(models.keys())[0], help="Model size")
   parser.add_argument("--max_context", type=int, default=4096, help="Max Context Length")
